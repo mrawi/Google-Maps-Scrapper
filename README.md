@@ -51,6 +51,10 @@ The repo currently has 3 branches
 
 ## Installation
 
+**Windows quick start:** double-click `run.bat`. It finds Python 3.9+ (and offers to install it with winget if missing), creates a virtual environment in `.venv`, installs the requirements (plus Playwright's Chromium, only if neither Chrome nor Edge is installed), then starts the [Web UI](#web-ui) and opens it in your browser. Later runs start the UI directly and only reinstall when `requirements.txt` changes. To use an existing virtual environment instead, run `set VENV_DIR=C:\path\to\venv` before `run.bat`.
+
+Manual installation:
+
 1. Clone this repository:
    ```bash
    git clone https://github.com/zohaibbashir/Google-Maps-Scrapper.git
@@ -60,7 +64,7 @@ The repo currently has 3 branches
    ```bash
    pip install -r requirements.txt
    ```
-3. Install the Playwright browser:
+3. Only if neither Google Chrome nor Microsoft Edge is installed, install Playwright's Chromium:
    ```bash
    playwright install chromium
    ```
@@ -103,7 +107,7 @@ python app.py
 Open http://127.0.0.1:5000, enter one search per line and the number of results per search. The browser window opens on your machine as usual, and the page shows the results with a CSV download link when the scrape finishes. CSV files are kept in the `results/` folder. It is meant for local, single-user use only.
 
 ## Notes
-- The script opens a visible browser window (not headless) for scraping.
+- The script opens a visible browser window (not headless) for scraping. It uses Google Chrome if installed, otherwise Microsoft Edge, otherwise Playwright's Chromium.
 - Google Maps DOM may change, which can break the script. If you encounter issues, update the XPaths in `main.py`.
 - If Google shows a cookie/consent page, click it in the opened browser window; the script waits for the search box.
 - Avoid running too many scrapes in a short period to prevent being blocked by Google.

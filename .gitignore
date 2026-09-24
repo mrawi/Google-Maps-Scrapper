@@ -4,3 +4,4 @@ result.csv
 output.csv
 playwright/.cache/ 
 results/
+.venv/

@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from typing import Iterator, List, Optional, Set
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Browser, Page, sync_playwright
 
 LISTING_XPATH = '//a[contains(@href, "https://www.google.com/maps/place")]'
 NAME_XPATH = '//div[@class="TIHn2 "]//h1[@class="DUwDvf lfPIob"]'
@@ -119,7 +119,8 @@ def place_key(url: str) -> str:
     return match.group(1) if match else url.split("?")[0]
 
 def load_results(page: Page, query: str, total: int):
-    page.goto("https://www.google.com/maps", timeout=60000)
+    # Force English: the parsing below (store options, hours) matches English text.
+    page.goto("https://www.google.com/maps?hl=en", timeout=60000)
     page.locator(SEARCH_BOX_XPATH).fill(query)
     page.keyboard.press("Enter")
     page.wait_for_selector(LISTING_XPATH)
@@ -181,11 +182,23 @@ def scrape_query(page: Page, query: str, total: int, seen: Set[str]) -> Iterator
         except Exception as e:
             logging.warning(f"Failed to extract listing {idx}: {e}")
 
+def launch_browser(p) -> Browser:
+    # Prefer an installed browser over Playwright's Chromium; Chrome first, Edge (ships with Windows) as backup.
+    for channel in ("chrome", "msedge"):
+        try:
+            browser = p.chromium.launch(channel=channel, headless=False)
+            logging.info(f"Using browser: {channel}")
+            return browser
+        except Exception:
+            pass
+    logging.info("Chrome and Edge not found, using Playwright's Chromium")
+    return p.chromium.launch(headless=False)
+
 def iter_places(queries: List[str], total: int) -> Iterator[Place]:
     seen: Set[str] = set()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
+        browser = launch_browser(p)
+        page = browser.new_page(locale="en-US")
         try:
             for query in queries:
                 try:
@@ -203,7 +216,7 @@ def scrape_places(queries: List[str], total: int) -> List[Place]:
         for place in iter_places(queries, total):
             places.append(place)
     except (KeyboardInterrupt, Exception) as e:
-        logging.warning(f"Scrape stopped early ({type(e).__name__}); keeping {len(places)} places.")
+        logging.warning(f"Scrape stopped early ({type(e).__name__}: {e}); keeping {len(places)} places.")
     return places
 
 def save_places_to_csv(places: List[Place], output_path: str = "result.csv", append: bool = False):
