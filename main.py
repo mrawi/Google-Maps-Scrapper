@@ -1,12 +1,17 @@
-import logging
-from typing import List, Optional
-from playwright.sync_api import sync_playwright, Page
-from dataclasses import dataclass, asdict
-import pandas as pd
 import argparse
-import platform
-import time
+import csv
+import logging
 import os
+import re
+import time
+from dataclasses import asdict, dataclass, fields
+from typing import Iterator, List, Optional, Set
+
+from playwright.sync_api import Page, sync_playwright
+
+LISTING_XPATH = '//a[contains(@href, "https://www.google.com/maps/place")]'
+NAME_XPATH = '//div[@class="TIHn2 "]//h1[@class="DUwDvf lfPIob"]'
+SEARCH_BOX_XPATH = "//form[contains(@jsaction,'searchboxFormSubmit')]//input[@name='q']"
 
 @dataclass
 class Place:
@@ -22,6 +27,7 @@ class Place:
     place_type: str = ""
     opens_at: str = ""
     introduction: str = ""
+    url: str = ""
 
 def setup_logging():
     logging.basicConfig(
@@ -39,7 +45,6 @@ def extract_text(page: Page, xpath: str) -> str:
 
 def extract_place(page: Page) -> Place:
     # XPaths
-    name_xpath = '//div[@class="TIHn2 "]//h1[@class="DUwDvf lfPIob"]'
     address_xpath = '//button[@data-item-id="address"]//div[contains(@class, "fontBodyMedium")]'
     website_xpath = '//a[@data-item-id="authority"]//div[contains(@class, "fontBodyMedium")]'
     phone_number_xpath = '//button[contains(@data-item-id, "phone:tel:")]//div[contains(@class, "fontBodyMedium")]'
@@ -54,7 +59,7 @@ def extract_place(page: Page) -> Place:
     intro_xpath = '//div[@class="WeS02d fontBodyMedium"]//div[@class="PYvSYb "]'
 
     place = Place()
-    place.name = extract_text(page, name_xpath)
+    place.name = extract_text(page, NAME_XPATH)
     place.address = extract_text(page, address_xpath)
     place.website = extract_text(page, website_xpath)
     place.phone_number = extract_text(page, phone_number_xpath)
@@ -95,94 +100,135 @@ def extract_place(page: Page) -> Place:
     if opens_at_raw:
         opens = opens_at_raw.split('⋅')
         if len(opens) > 1:
-            place.opens_at = opens[1].replace("\u202f","")
+            place.opens_at = opens[1].replace(" ","")
         else:
-            place.opens_at = opens_at_raw.replace("\u202f","")
+            place.opens_at = opens_at_raw.replace(" ","")
     else:
         opens_at2_raw = extract_text(page, opens_at_xpath2)
         if opens_at2_raw:
             opens = opens_at2_raw.split('⋅')
             if len(opens) > 1:
-                place.opens_at = opens[1].replace("\u202f","")
+                place.opens_at = opens[1].replace(" ","")
             else:
-                place.opens_at = opens_at2_raw.replace("\u202f","")
+                place.opens_at = opens_at2_raw.replace(" ","")
     return place
 
-def scrape_places(search_for: str, total: int) -> List[Place]:
-    setup_logging()
-    places: List[Place] = []
+def place_key(url: str) -> str:
+    # Maps place URLs embed a stable feature id ("!1s0x...:0x..."); the rest varies by search.
+    match = re.search(r"!1s(0x[0-9a-f]+:0x[0-9a-f]+)", url)
+    return match.group(1) if match else url.split("?")[0]
+
+def load_results(page: Page, query: str, total: int):
+    page.goto("https://www.google.com/maps", timeout=60000)
+    page.locator(SEARCH_BOX_XPATH).fill(query)
+    page.keyboard.press("Enter")
+    page.wait_for_selector(LISTING_XPATH)
+    page.locator(LISTING_XPATH).first.hover()
+    previously_counted = 0
+    stalls = 0
+    while True:
+        page.mouse.wheel(0, 10000)
+        page.wait_for_timeout(1500)
+        found = page.locator(LISTING_XPATH).count()
+        logging.info(f"Currently Found: {found}")
+        if found >= total:
+            break
+        if page.get_by_text("reached the end of the list").count() > 0:
+            logging.info("Arrived at all available")
+            break
+        stalls = stalls + 1 if found == previously_counted else 0
+        if stalls >= 3:
+            logging.info("No new results after several scrolls, stopping")
+            break
+        previously_counted = found
+
+def scrape_query(page: Page, query: str, total: int, seen: Set[str]) -> Iterator[Place]:
+    logging.info(f"Searching: {query}")
+    load_results(page, query, total)
+    listings = page.locator(LISTING_XPATH).all()[:total]
+    logging.info(f"Total Found: {len(listings)}")
+    for idx, listing in enumerate(listings, 1):
+        url = (listing.get_attribute("href") or "").split("?")[0]
+        key = place_key(url)
+        if key in seen:
+            logging.info(f"Listing {idx} already scraped, skipping.")
+            continue
+        try:
+            previous_name = extract_text(page, NAME_XPATH)
+            listing.locator("xpath=..").click()
+            try:
+                # Wait for the detail pane to switch away from the previously opened place.
+                page.wait_for_function(
+                    """([xpath, previousName, key]) => {
+                        const el = document.evaluate(xpath, document, null,
+                            XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                        const name = el ? el.innerText.trim() : "";
+                        return name && (name !== previousName || location.href.includes(key));
+                    }""",
+                    arg=[NAME_XPATH, previous_name, key],
+                    timeout=10000,
+                )
+            except Exception:
+                logging.warning(f"Detail pane for listing {idx} may not have refreshed.")
+            time.sleep(1.5)  # Other fields render after the name
+            place = extract_place(page)
+            if place.name:
+                place.url = url
+                seen.add(key)
+                yield place
+            else:
+                logging.warning(f"No name found for listing {idx}, skipping.")
+        except Exception as e:
+            logging.warning(f"Failed to extract listing {idx}: {e}")
+
+def iter_places(queries: List[str], total: int) -> Iterator[Place]:
+    seen: Set[str] = set()
     with sync_playwright() as p:
-        if platform.system() == "Windows":
-            browser_path = r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-            browser = p.chromium.launch(executable_path=browser_path, headless=False)
-        else:
-            browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=False)
         page = browser.new_page()
         try:
-            page.goto("https://www.google.com/maps/@32.9817464,70.1930781,3.67z?", timeout=60000)
-            page.wait_for_timeout(1000)
-            page.locator("//form[contains(@jsaction,'searchboxFormSubmit')]//input[@name='q']").fill(search_for)
-            page.keyboard.press("Enter")
-            page.wait_for_selector('//a[contains(@href, "https://www.google.com/maps/place")]')
-            page.hover('//a[contains(@href, "https://www.google.com/maps/place")]')
-            previously_counted = 0
-            while True:
-                page.mouse.wheel(0, 10000)
-                page.wait_for_selector('//a[contains(@href, "https://www.google.com/maps/place")]')
-                found = page.locator('//a[contains(@href, "https://www.google.com/maps/place")]').count()
-                logging.info(f"Currently Found: {found}")
-                if found >= total:
-                    break
-                if found == previously_counted:
-                    logging.info("Arrived at all available")
-                    break
-                previously_counted = found
-            listings = page.locator('//a[contains(@href, "https://www.google.com/maps/place")]').all()[:total]
-            listings = [listing.locator("xpath=..") for listing in listings]
-            logging.info(f"Total Found: {len(listings)}")
-            for idx, listing in enumerate(listings):
+            for query in queries:
                 try:
-                    listing.click()
-                    page.wait_for_selector('//div[@class="TIHn2 "]//h1[@class="DUwDvf lfPIob"]', timeout=10000)
-                    time.sleep(1.5)  # Give time for details to load
-                    place = extract_place(page)
-                    if place.name:
-                        places.append(place)
-                    else:
-                        logging.warning(f"No name found for listing {idx+1}, skipping.")
+                    yield from scrape_query(page, query, total, seen)
                 except Exception as e:
-                    logging.warning(f"Failed to extract listing {idx+1}: {e}")
+                    logging.error(f"Search '{query}' failed: {e}")
         finally:
             browser.close()
+
+def scrape_places(queries: List[str], total: int) -> List[Place]:
+    """Scrape up to `total` places per query; returns whatever was collected even if interrupted."""
+    setup_logging()
+    places: List[Place] = []
+    try:
+        for place in iter_places(queries, total):
+            places.append(place)
+    except (KeyboardInterrupt, Exception) as e:
+        logging.warning(f"Scrape stopped early ({type(e).__name__}); keeping {len(places)} places.")
     return places
 
 def save_places_to_csv(places: List[Place], output_path: str = "result.csv", append: bool = False):
-    df = pd.DataFrame([asdict(place) for place in places])
-    if not df.empty:
-        for column in df.columns:
-            if df[column].nunique() == 1:
-                df.drop(column, axis=1, inplace=True)
-        file_exists = os.path.isfile(output_path)
-        mode = "a" if append else "w"
-        header = not (append and file_exists)
-        df.to_csv(output_path, index=False, mode=mode, header=header)
-        logging.info(f"Saved {len(df)} places to {output_path} (append={append})")
-    else:
-        logging.warning("No data to save. DataFrame is empty.")
+    if not places:
+        logging.warning("No data to save.")
+        return
+    columns = [f.name for f in fields(Place)]
+    write_header = not (append and os.path.isfile(output_path))
+    with open(output_path, "a" if append else "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(asdict(place) for place in places)
+    logging.info(f"Saved {len(places)} places to {output_path} (append={append})")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-s", "--search", type=str, help="Search query for Google Maps")
-    parser.add_argument("-t", "--total", type=int, help="Total number of results to scrape")
+    parser.add_argument("-s", "--search", action="append", help="Search query for Google Maps (repeat for several searches)")
+    parser.add_argument("-t", "--total", type=int, default=1, help="Number of results to scrape per search")
     parser.add_argument("-o", "--output", type=str, default="result.csv", help="Output CSV file path")
     parser.add_argument("--append", action="store_true", help="Append results to the output file instead of overwriting")
     args = parser.parse_args()
-    search_for = args.search or "turkish stores in toronto Canada"
-    total = args.total or 1
-    output_path = args.output
-    append = args.append
-    places = scrape_places(search_for, total)
-    save_places_to_csv(places, output_path, append=append)
+    queries = args.search or ["turkish stores in toronto Canada"]
+    places = scrape_places(queries, args.total)
+    save_places_to_csv(places, args.output, append=args.append)
 
 if __name__ == "__main__":
     main()
